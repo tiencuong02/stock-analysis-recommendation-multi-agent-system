@@ -86,9 +86,32 @@ async def lifespan(app: FastAPI):
         from app.db.redis import get_redis
         app.state.ticker_cache = TickerContextCache(redis_client=get_redis())
         app.state.rag_pipeline.set_ticker_cache(app.state.ticker_cache)
+
+        vs = app.state.vector_store
+        rp = app.state.rag_pipeline
+        logger.info(
+            f"RAG init status — "
+            f"embeddings={'OK' if vs.embeddings else 'FAIL'} | "
+            f"qdrant_client={'OK' if vs._client else 'FAIL'} | "
+            f"qdrant_store={'OK' if vs._store else 'FAIL'} | "
+            f"cross_encoder={'OK' if vs._cross_encoder else 'WARN(disabled)'} | "
+            f"llm={'OK' if rp.llm else 'FAIL'}"
+        )
+        if not rp.llm:
+            logger.error(
+                "RAG pipeline LLM is None — chatbot will return 'chưa sẵn sàng'. "
+                "Check Ollama is running and model is pulled: "
+                f"ollama pull {settings.OLLAMA_MODEL}"
+            )
+        if not vs._store:
+            logger.error(
+                f"Qdrant store is None — vector search disabled. "
+                f"Ensure Qdrant is running at {settings.QDRANT_URL}"
+            )
         logger.info("RAG services initialized successfully.")
     except Exception as e:
-        logger.warning(f"RAG services initialization skipped: {e}")
+        import traceback as _tb
+        logger.error(f"RAG services initialization failed: {e}\n{_tb.format_exc()}")
         app.state.vector_store = None
         app.state.rag_pipeline = None
 
@@ -154,4 +177,21 @@ async def health_check():
     return {
         "status": "healthy",
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+    }
+
+@app.get("/health/rag")
+async def rag_health_check():
+    """Chẩn đoán trạng thái từng thành phần RAG — dùng khi chatbot báo 'chưa sẵn sàng'."""
+    vs = getattr(app.state, "vector_store", None)
+    rp = getattr(app.state, "rag_pipeline", None)
+    return {
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "rag_pipeline_initialized": rp is not None,
+        "llm_ready":                rp.llm is not None if rp else False,
+        "embeddings_ready":         vs.embeddings is not None if vs else False,
+        "qdrant_client_ready":      vs._client is not None if vs else False,
+        "qdrant_store_ready":       vs._store is not None if vs else False,
+        "cross_encoder_ready":      vs._cross_encoder is not None if vs else False,
+        "chatbot_will_work":        (rp is not None and rp.llm is not None),
+        "vector_search_will_work":  (vs is not None and vs._store is not None),
     }

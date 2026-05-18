@@ -19,7 +19,6 @@ import time
 import asyncio
 from typing import Dict, Any, List, Optional, AsyncGenerator
 
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
@@ -36,8 +35,6 @@ from app.services.rag.chat_tools import TOOL_DEFINITIONS, ToolExecutor, build_to
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
-
-GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
 
 # Regex phát hiện so sánh giá 2+ mã: "so sánh FPT VNM", "FPT vs VNM", "FPT với VNM"
 _PRICE_COMPARE_RE = re.compile(
@@ -301,47 +298,26 @@ class RAGPipelineService:
         llm,
     ) -> None:
         """
-        [DISABLED] Groundedness check bằng LLM đã bị tắt để tiết kiệm quota.
-        Hàm giữ lại để tương thích API, nhưng không gọi LLM nữa.
-        Bật lại khi có billing plan hoặc GROQ_API_KEY.
+        [DISABLED] Groundedness check bằng LLM đã bị tắt.
+        Hàm giữ lại để tương thích API, nhưng không gọi LLM.
         """
-        return  # No-op — tránh tốn 1 Gemini call ngầm mỗi request
+        return  # No-op
 
     def _init_llm(self):
-        if not settings.GEMINI_API_KEY:
-            logger.warning("GEMINI_API_KEY not set — RAG pipeline disabled.")
+        # Khởi tạo Ollama local LLM (không cần API key)
+        self._llm_provider = LLMProvider()
+        self.llm = self._llm_provider.primary
+
+        if self.llm is None:
+            logger.error("Ollama LLM not available — RAG pipeline disabled.")
             return
 
-        initialized = []
-        for model_name in GEMINI_MODELS:
-            try:
-                llm = ChatGoogleGenerativeAI(
-                    model=model_name,
-                    google_api_key=settings.GEMINI_API_KEY,
-                    temperature=0.1,   # thấp hơn → ít hallucinate hơn
-                    convert_system_message_to_human=True,
-                )
-                initialized.append((model_name, llm))
-            except Exception as e:
-                logger.warning(f"Cannot init {model_name}: {e}")
-
-        if not initialized:
-            logger.error("No Gemini model available.")
-            return
-
-        _, self.llm = initialized[0]
-        self.llm_fallbacks = [llm for _, llm in initialized[1:]]
-        logger.info(f"LLMs ready: {[n for n, _ in initialized]}")
+        self.llm_fallbacks = []
+        logger.info(f"LLM ready: Ollama ({settings.OLLAMA_MODEL})")
 
         # Init router và CRAG sau khi có LLM
         self._intent_router = IntentRouter(llm=self.llm)
         self._crag = CRAGEvaluator(llm=self.llm)
-
-        # Multi-provider LLM (Gemini primary + Groq fallback)
-        self._llm_provider = LLMProvider(
-            gemini_llm=self.llm,
-            groq_api_key=settings.GROQ_API_KEY or "",
-        )
 
         # Native tool executor
         self._tool_executor = ToolExecutor(
@@ -1424,7 +1400,7 @@ class RAGPipelineService:
     ) -> Dict[str, Any]:
         if not self._is_ready():
             return {
-                "answer": "Hệ thống RAG chưa sẵn sàng. Kiểm tra GEMINI_API_KEY.",
+                "answer": "Hệ thống RAG chưa sẵn sàng. Kiểm tra kết nối Ollama.",
                 "sources": [],
             }
 

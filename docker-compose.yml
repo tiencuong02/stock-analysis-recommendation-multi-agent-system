@@ -1,4 +1,43 @@
 services:
+  qdrant:
+    image: qdrant/qdrant:v1.9.2
+    container_name: stock_analysis_qdrant
+    restart: on-failure
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/6333 && echo ok && exec 3>&-' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: stock_analysis_ollama
+    restart: on-failure
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    # GPU passthrough — bỏ comment nếu server có NVIDIA GPU
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
   backend:
     build:
       context: ./backend
@@ -14,6 +53,8 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - KAFKA_BROKER_URL=kafka:9092
       - ALPHA_VANTAGE_API_KEY=${ALPHA_VANTAGE_API_KEY}
+      - QDRANT_URL=http://qdrant:6333
+      - OLLAMA_BASE_URL=http://ollama:11434
       # Cache HuggingFace models vào volume — tải 1 lần duy nhất
       - HF_HOME=/app/.cache/huggingface
       - TRANSFORMERS_CACHE=/app/.cache/huggingface
@@ -28,6 +69,10 @@ services:
       redis:
         condition: service_healthy
       kafka:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      ollama:
         condition: service_healthy
 
   worker:
@@ -44,6 +89,8 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - KAFKA_BROKER_URL=kafka:9092
       - ALPHA_VANTAGE_API_KEY=${ALPHA_VANTAGE_API_KEY}
+      - QDRANT_URL=http://qdrant:6333
+      - OLLAMA_BASE_URL=http://ollama:11434
       - HF_HOME=/app/.cache/huggingface
       - TRANSFORMERS_CACHE=/app/.cache/huggingface
     volumes:
@@ -59,6 +106,10 @@ services:
       redis:
         condition: service_healthy
       kafka:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      ollama:
         condition: service_healthy
 
   frontend:
@@ -147,3 +198,5 @@ volumes:
   mongo_data:
   redis_data:
   hf_model_cache:
+  qdrant_data:
+  ollama_models:

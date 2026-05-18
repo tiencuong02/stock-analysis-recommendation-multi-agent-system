@@ -284,7 +284,7 @@ async def upload_pdf(
     vector_store: VectorStoreService = Depends(get_vector_store),
     db=Depends(get_db),
 ):
-    """Admin: upload PDF → hierarchical chunking → embed → Pinecone namespace chỉ định."""
+    """Admin: upload PDF → hierarchical chunking → embed → Qdrant namespace chỉ định."""
 
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Chỉ chấp nhận file PDF.")
@@ -355,7 +355,7 @@ async def upload_pdf(
             "ticker":            effective_ticker,
             "doc_type":          doc_type,
             "namespace_type":    namespace_type.lower(),
-            "pinecone_namespace": target_namespace,
+            "qdrant_namespace":  target_namespace,
             "period":            period,
             "year":              doc_year,
             "embedding_model":   "paraphrase-multilingual-MiniLM-L12-v2",
@@ -401,7 +401,7 @@ async def upload_pdf(
                 "ticker":            effective_ticker,
                 "doc_type":          doc_type,
                 "namespace_type":    namespace_type,
-                "pinecone_namespace": target_namespace,
+                "qdrant_namespace":  target_namespace,
                 "period":            period,
                 "year":              doc_year,
                 "chunks_count":      len(chunks),
@@ -473,7 +473,7 @@ async def delete_document(
     vector_store: VectorStoreService = Depends(get_vector_store),
     db=Depends(get_db)
 ):
-    """Delete a document record and its vectors from Pinecone."""
+    """Delete a document record and its vectors from Qdrant."""
     if db is None:
         raise HTTPException(status_code=500, detail="Database not available")
 
@@ -519,90 +519,91 @@ async def reindex_document(
 ):
     """
     Di chuyển vectors của một tài liệu sang Namespace khác (Re-index từng phần).
-    Không cần tính toán lại embedding, chỉ cần copy + delete trên Pinecone.
+    Với Qdrant, chỉ cần cập nhật payload field 'namespace' — không cần copy/delete vectors.
     """
     if db is None:
         raise HTTPException(status_code=500, detail="Database not available")
-    
+
     try:
         obj_id = ObjectId(doc_id)
         doc = await db["knowledge_base"].find_one({"_id": obj_id})
         if not doc:
             raise HTTPException(status_code=404, detail="Document not found")
-        
-        # Ưu tiên pinecone_namespace (được cập nhật sau mỗi lần move)
-        # fallback về namespace → namespace_type → mặc định advisory
+
+        # Ưu tiên qdrant_namespace → pinecone_namespace (backwards compat) → fallback
         current_ns = (
-            doc.get("pinecone_namespace")
+            doc.get("qdrant_namespace")
+            or doc.get("pinecone_namespace")
             or doc.get("namespace")
             or _NAMESPACE_MAP.get(doc.get("namespace_type", "advisory"), NAMESPACE_ADVISORY)
         )
         target_ns = _NAMESPACE_MAP.get(target_namespace_type.lower(), NAMESPACE_ADVISORY)
-        
+
         if current_ns == target_ns:
             return {"status": "success", "message": "Tài liệu đã ở namespace này rồi."}
-        
+
         doc_id_field = doc.get("document_id")
         if not doc_id_field:
             raise HTTPException(status_code=400, detail="Tài liệu không có document_id.")
 
-        # 1. Query tất cả vectors theo metadata filter — không cần biết UUID của langchain
-        BATCH = 1000
-        vectors_to_upsert = []
-        seen_ids: set = set()
+        if vector_store._client is None:
+            raise HTTPException(status_code=503, detail="Qdrant client chưa sẵn sàng.")
 
-        query_resp = await asyncio.to_thread(
-            vector_store._pinecone_index.query,
-            vector=[0.0] * 384,
-            top_k=BATCH,
-            filter={"document_id": doc_id_field},
-            namespace=current_ns,
-            include_values=True,
-            include_metadata=True,
-        )
-        for match in query_resp.get("matches", []):
-            if match["id"] not in seen_ids:
-                seen_ids.add(match["id"])
-                vectors_to_upsert.append({
-                    "id":       match["id"],
-                    "values":   match["values"],
-                    "metadata": match.get("metadata", {}),
-                })
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        from app.core.config import settings as _cfg
 
-        if not vectors_to_upsert:
-            raise HTTPException(status_code=404, detail="Không tìm thấy vectors trên Pinecone cho tài liệu này.")
+        scroll_filter = Filter(must=[
+            FieldCondition(key="document_id", match=MatchValue(value=doc_id_field)),
+            FieldCondition(key="namespace",    match=MatchValue(value=current_ns)),
+        ])
 
-        # 2. Upsert sang namespace mới (theo batch 200)
-        for i in range(0, len(vectors_to_upsert), 200):
-            await asyncio.to_thread(
-                vector_store._pinecone_index.upsert,
-                vectors=vectors_to_upsert[i:i + 200],
-                namespace=target_ns,
+        # 1. Scroll qua tất cả points khớp điều kiện
+        all_ids = []
+        offset = None
+        while True:
+            result, next_offset = await asyncio.to_thread(
+                vector_store._client.scroll,
+                collection_name=_cfg.QDRANT_COLLECTION_NAME,
+                scroll_filter=scroll_filter,
+                limit=1000,
+                offset=offset,
+                with_payload=False,
+                with_vectors=False,
             )
+            all_ids.extend([p.id for p in result])
+            if next_offset is None:
+                break
+            offset = next_offset
 
-        # 3. Xóa ở namespace cũ bằng metadata filter
+        if not all_ids:
+            raise HTTPException(status_code=404, detail="Không tìm thấy vectors trong Qdrant cho tài liệu này.")
+
+        # 2. Cập nhật payload field 'namespace' — không cần copy/delete vector
         await asyncio.to_thread(
-            vector_store._pinecone_index.delete,
-            filter={"document_id": doc_id_field},
-            namespace=current_ns,
+            vector_store._client.set_payload,
+            collection_name=_cfg.QDRANT_COLLECTION_NAME,
+            payload={"namespace": target_ns},
+            points=all_ids,
         )
 
-        # 4. Cập nhật MongoDB
+        # 3. Cập nhật MongoDB
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         await db["knowledge_base"].update_one(
             {"_id": obj_id},
             {"$set": {
-                "namespace":          target_ns,
-                "pinecone_namespace": target_ns,
-                "namespace_type":     target_namespace_type.lower(),
-                "reindexed_at":       now,
-                "chunks_count":       len(vectors_to_upsert),
+                "namespace":       target_ns,
+                "qdrant_namespace": target_ns,
+                "namespace_type":  target_namespace_type.lower(),
+                "reindexed_at":    now,
+                "chunks_count":    len(all_ids),
             }}
         )
 
-        logger.info(f"Moved {doc_id_field}: {current_ns} → {target_ns} ({len(vectors_to_upsert)} vectors)")
-        return {"status": "success", "message": f"Đã chuyển {len(vectors_to_upsert)} vectors sang ngăn {target_namespace_type.upper()}"}
-        
+        logger.info(f"Moved {doc_id_field}: {current_ns} → {target_ns} ({len(all_ids)} points)")
+        return {"status": "success", "message": f"Đã chuyển {len(all_ids)} vectors sang ngăn {target_namespace_type.upper()}"}
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Re-indexing failed: {e}")
         raise HTTPException(status_code=500, detail=f"Lỗi khi di chuyển dữ liệu: {str(e)}")
@@ -641,7 +642,7 @@ async def backfill_documents(
             if "document_id" not in doc:
                 update_fields["document_id"] = f"doc_{ticker}_{year}_{short_id}"
             if "vector_store" not in doc:
-                update_fields["vector_store"] = "pinecone"
+                update_fields["vector_store"] = "qdrant"
             if "namespace" not in doc:
                 update_fields["namespace"] = NAMESPACE_ADVISORY
             if "embedding_model" not in doc:
@@ -784,13 +785,16 @@ async def debug_search(
     vector_store: VectorStoreService = Depends(get_vector_store),
 ):
     """
-    Admin debug: kiểm tra raw similarity scores từ Pinecone — không qua threshold filter.
+    Admin debug: kiểm tra raw similarity scores từ Qdrant — không qua threshold filter.
     Giúp chẩn đoán vì sao chatbot báo 'chưa đủ tài liệu'.
     """
     from app.services.rag.vector_store import (
         NAMESPACE_ADVISORY, NAMESPACE_KNOWLEDGE, NAMESPACE_FAQ,
         SIMILARITY_THRESHOLD_ADVISORY,
+        _NS_FIELD,
     )
+    from app.core.config import settings as _cfg
+    from qdrant_client.models import Filter, FieldCondition, MatchValue
 
     embedding_model = "unknown"
     if vector_store.embeddings:
@@ -799,55 +803,60 @@ async def debug_search(
         except Exception:
             embedding_model = str(type(vector_store.embeddings))
 
-    # Pinecone index stats
+    # Qdrant collection stats
     index_stats = {}
-    if vector_store._pinecone_index:
+    if vector_store._client:
         try:
-            stats = vector_store._pinecone_index.describe_index_stats()
+            col_info = vector_store._client.get_collection(_cfg.QDRANT_COLLECTION_NAME)
+            ns_stats = {}
+            for ns_name in [NAMESPACE_ADVISORY, NAMESPACE_KNOWLEDGE, NAMESPACE_FAQ]:
+                ns_filter = Filter(must=[FieldCondition(key=_NS_FIELD, match=MatchValue(value=ns_name))])
+                cnt = vector_store._client.count(
+                    collection_name=_cfg.QDRANT_COLLECTION_NAME,
+                    count_filter=ns_filter,
+                    exact=True,
+                )
+                ns_stats[ns_name] = {"vector_count": cnt.count}
+            dim = getattr(col_info.config.params.vectors, "size", None)
             index_stats = {
-                "dimension":        stats.dimension,
-                "total_vectors":    stats.total_vector_count,
-                "namespaces":       {
-                    ns: {"vector_count": info.vector_count}
-                    for ns, info in (stats.namespaces or {}).items()
-                },
+                "dimension":     dim,
+                "total_vectors": col_info.points_count,
+                "namespaces":    ns_stats,
             }
         except Exception as e:
             index_stats = {"error": str(e)}
 
-    # Raw search without threshold filter
-    filter_meta = {"ticker": ticker.upper()} if ticker else None
+    # Raw search without threshold filter — dùng _store với Qdrant filter
     raw_results = {}
-
-    for ns in [NAMESPACE_ADVISORY, NAMESPACE_KNOWLEDGE, NAMESPACE_FAQ]:
-        store = vector_store._ns_stores.get(ns)
-        if store is None:
-            continue
-        try:
-            hits = store.similarity_search_with_score(
-                query=query, k=5, filter=filter_meta
-            )
-            raw_results[ns or "__default__"] = [
-                {
-                    "score":   round(float(sc), 4),
-                    "passes_threshold": float(sc) >= SIMILARITY_THRESHOLD_ADVISORY,
-                    "ticker":  doc.metadata.get("ticker", "?"),
-                    "source":  doc.metadata.get("source", "?"),
-                    "page":    doc.metadata.get("page", "?"),
-                    "preview": doc.page_content[:120].replace("\n", " "),
-                }
-                for doc, sc in hits
-            ]
-        except Exception as e:
-            raw_results[ns or "__default__"] = {"error": str(e)}
+    if vector_store._store is not None:
+        for ns in [NAMESPACE_ADVISORY, NAMESPACE_KNOWLEDGE, NAMESPACE_FAQ]:
+            extra = {"ticker": ticker.upper()} if ticker else None
+            qdrant_filter = vector_store._build_filter(ns, extra)
+            try:
+                hits = vector_store._store.similarity_search_with_score(
+                    query=query, k=5, filter=qdrant_filter
+                )
+                raw_results[ns] = [
+                    {
+                        "score":             round(float(sc), 4),
+                        "passes_threshold":  float(sc) >= SIMILARITY_THRESHOLD_ADVISORY,
+                        "ticker":            doc.metadata.get("ticker", "?"),
+                        "source":            doc.metadata.get("source", "?"),
+                        "page":              doc.metadata.get("page", "?"),
+                        "preview":           doc.page_content[:120].replace("\n", " "),
+                    }
+                    for doc, sc in hits
+                ]
+            except Exception as e:
+                raw_results[ns] = {"error": str(e)}
 
     return {
-        "query":            query,
-        "ticker_filter":    ticker.upper() if ticker else None,
-        "embedding_model":  embedding_model,
+        "query":              query,
+        "ticker_filter":      ticker.upper() if ticker else None,
+        "embedding_model":    embedding_model,
         "advisory_threshold": SIMILARITY_THRESHOLD_ADVISORY,
-        "pinecone_index":   index_stats,
-        "raw_results":      raw_results,
+        "qdrant_collection":  index_stats,
+        "raw_results":        raw_results,
     }
 
 
